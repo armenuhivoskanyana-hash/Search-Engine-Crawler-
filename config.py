@@ -1,0 +1,2 @@
+# config.py - Replace your current connection string with this
+MONGODB_CONNECTION = "mongodb+srv://armine_voskanyan1_db:Ami%406799@crawler.hachyvv.mongodb.net/?retryWrites=true&w=majority&appName=crawler&tls=true&tlsAllowInvalidCertificates=true"

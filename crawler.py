@@ -8,13 +8,16 @@ import urllib.robotparser
 from urllib.parse import urljoin, urlparse, urlunparse
 from typing import Set, List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import re
 from bs4 import BeautifulSoup
 import sqlite3
 from contextlib import asynccontextmanager
 import random
+from config import MONGODB_CONNECTION
+import pymongo
+import ssl
 
 @dataclass
 class CrawledPage:
@@ -31,6 +34,145 @@ class CrawledPage:
     outbound_links: List[str]
     page_size: int
     load_time: float
+
+class MongoDBIndexer:
+    """Handles MongoDB indexing for search engine"""
+    
+    def __init__(self, connection_string: str):
+        """Initialize MongoDB connection"""
+        try:
+            self.client = pymongo.MongoClient(
+                connection_string,
+                ssl_cert_reqs=ssl.CERT_NONE  # For Mac SSL issues
+            )
+            self.db = self.client['search_engine']
+            self.collection = self.db['pages']
+            
+            # Test connection
+            self.client.admin.command('ping')
+            
+            # Setup indexes for better search performance
+            self._setup_indexes()
+            
+            logging.info("✓ MongoDB connection successful!")
+            
+        except Exception as e:
+            logging.error(f"✗ MongoDB connection failed: {e}")
+            raise
+    
+    def _setup_indexes(self):
+        """Create indexes for efficient searching"""
+        try:
+            # Text index for full-text search
+            self.collection.create_index([
+                ("title", "text"),
+                ("content", "text"),
+                ("meta_description", "text")
+            ])
+            
+            # URL index for uniqueness and quick lookups
+            self.collection.create_index("url", unique=True)
+            
+            # Domain index for filtering by site
+            self.collection.create_index("domain")
+            
+            # Date index for freshness sorting
+            self.collection.create_index("crawled_at")
+            
+            # Content hash for deduplication
+            self.collection.create_index("content_hash")
+            
+            logging.info("✓ MongoDB indexes created successfully!")
+            
+        except pymongo.errors.DuplicateKeyError:
+            logging.info("MongoDB indexes already exist")
+        except Exception as e:
+            logging.warning(f"Index creation warning: {e}")
+    
+    def extract_domain(self, url: str) -> str:
+        """Extract domain from URL"""
+        return urlparse(url).netloc
+    
+    def generate_page_id(self, url: str) -> str:
+        """Generate unique ID for page"""
+        return hashlib.md5(url.encode()).hexdigest()
+    
+    async def index_page(self, page: CrawledPage) -> bool:
+        """Index a single crawled page to MongoDB"""
+        try:
+            # Prepare document for MongoDB
+            page_doc = {
+                '_id': self.generate_page_id(page.url),
+                'url': page.url,
+                'title': page.title,
+                'content': page.content,
+                'meta_description': page.meta_description,
+                'keywords': self._extract_keywords(page.content),
+                'outbound_links': page.outbound_links,
+                'domain': self.extract_domain(page.url),
+                'status_code': page.status_code,
+                'content_type': page.content_type,
+                'content_hash': page.content_hash,
+                'content_length': page.page_size,
+                'word_count': len(page.content.split()),
+                'load_time': page.load_time,
+                'crawled_at': datetime.now(timezone.utc),
+                'last_crawled': page.last_crawled,
+                'indexed': True
+            }
+            
+            # Insert or update (upsert)
+            result = self.collection.replace_one(
+                {'_id': page_doc['_id']}, 
+                page_doc, 
+                upsert=True
+            )
+            
+            if result.upserted_id:
+                logging.info(f"✓ Indexed new page: {page.url}")
+            else:
+                logging.info(f"✓ Updated existing page: {page.url}")
+                
+            return True
+            
+        except Exception as e:
+            logging.error(f"✗ Error indexing {page.url}: {e}")
+            return False
+    
+    def _extract_keywords(self, content: str) -> List[str]:
+        """Extract simple keywords from content"""
+        # Simple keyword extraction (you can make this more sophisticated)
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', content.lower())
+        # Get most common words (excluding common stop words)
+        stop_words = {'the', 'and', 'are', 'for', 'not', 'but', 'this', 'that', 'with', 'from'}
+        keywords = [word for word in words if word not in stop_words]
+        # Return top 20 most frequent keywords
+        from collections import Counter
+        return [word for word, count in Counter(keywords).most_common(20)]
+    
+    def search_pages(self, query: str, limit: int = 10) -> List[Dict]:
+        """Search indexed pages"""
+        try:
+            results = self.collection.find(
+                {"$text": {"$search": query}},
+                {"score": {"$meta": "textScore"}}
+            ).sort([("score", {"$meta": "textScore"})]).limit(limit)
+            
+            return list(results)
+            
+        except Exception as e:
+            logging.error(f"Search error: {e}")
+            return []
+    
+    def get_indexed_count(self) -> int:
+        """Get total number of indexed pages"""
+        return self.collection.count_documents({})
+    
+    def close_connection(self):
+        """Close MongoDB connection"""
+        if self.client:
+            self.client.close()
+            logging.info("MongoDB connection closed")
 
 class RobotsTxtChecker:
     """Handles robots.txt compliance"""
@@ -210,7 +352,7 @@ class ContentProcessor:
         return metadata
 
 class WebCrawler:
-    """Main web crawler class"""
+    """Main web crawler class with MongoDB integration"""
     
     def __init__(self, 
                  max_concurrent: int = 10,
@@ -231,10 +373,14 @@ class WebCrawler:
         self.robots_checker = RobotsTxtChecker()
         self.content_processor = ContentProcessor()
         
+        # Initialize MongoDB indexer
+        self.mongodb_indexer = MongoDBIndexer(MONGODB_CONNECTION)
+        
         # Statistics
         self.stats = {
             'pages_crawled': 0,
             'pages_failed': 0,
+            'pages_indexed': 0,
             'total_size': 0,
             'start_time': None,
             'domains_crawled': set()
@@ -348,8 +494,8 @@ class WebCrawler:
         return None
     
     async def _save_page(self, page: CrawledPage):
-        """Save crawled page to database and file system"""
-        # Save to database
+        """Save crawled page to database, file system, AND MongoDB"""
+        # Save to SQLite database (original functionality)
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute("""
@@ -366,7 +512,7 @@ class WebCrawler:
         finally:
             conn.close()
         
-        # Save to JSON file
+        # Save to JSON file (original functionality)
         import os
         os.makedirs(self.output_dir, exist_ok=True)
         
@@ -376,6 +522,10 @@ class WebCrawler:
         
         async with aiofiles.open(filename, 'w') as f:
             await f.write(json.dumps(asdict(page), indent=2, ensure_ascii=False))
+        
+        # NEW: Index to MongoDB for search functionality
+        if await self.mongodb_indexer.index_page(page):
+            self.stats['pages_indexed'] += 1
     
     async def _crawl_worker(self, session: aiohttp.ClientSession):
         """Worker coroutine for crawling pages"""
@@ -409,7 +559,7 @@ class WebCrawler:
                 self.stats['pages_failed'] += 1
             
             # Log progress
-            if self.stats['pages_crawled'] % 100 == 0:
+            if self.stats['pages_crawled'] % 10 == 0 and self.stats['pages_crawled'] > 0:  # More frequent logging
                 self._log_stats()
     
     def _log_stats(self):
@@ -417,13 +567,16 @@ class WebCrawler:
         elapsed = time.time() - self.stats['start_time']
         pages_per_sec = self.stats['pages_crawled'] / elapsed if elapsed > 0 else 0
         queue_size = self.url_queue.get_queue_size()
+        mongodb_count = self.mongodb_indexer.get_indexed_count()
         
         self.logger.info(
             f"Stats: {self.stats['pages_crawled']} crawled, "
+            f"{self.stats['pages_indexed']} indexed to MongoDB, "
             f"{self.stats['pages_failed']} failed, "
             f"{queue_size} queued, "
             f"{pages_per_sec:.2f} pages/sec, "
-            f"{len(self.stats['domains_crawled'])} domains"
+            f"{len(self.stats['domains_crawled'])} domains, "
+            f"{mongodb_count} total in search index"
         )
     
     def add_seed_urls(self, urls: List[str], priority: int = 5):
@@ -435,9 +588,16 @@ class WebCrawler:
     async def crawl(self):
         """Start the crawling process"""
         self.stats['start_time'] = time.time()
-        self.logger.info("Starting web crawler...")
+        self.logger.info("Starting web crawler with MongoDB indexing...")
         
-        connector = aiohttp.TCPConnector(limit=100, limit_per_host=10)
+        # Create SSL context that uses system certificates
+        ssl_context = ssl.create_default_context()
+        
+        connector = aiohttp.TCPConnector(
+            limit=100, 
+            limit_per_host=10,
+            ssl=ssl_context  # Use system SSL certificates
+        )
         timeout = aiohttp.ClientTimeout(total=30)
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -452,12 +612,20 @@ class WebCrawler:
         
         self._log_stats()
         self.logger.info("Crawling completed!")
+        
+        # Close MongoDB connection
+        self.mongodb_indexer.close_connection()
+    
+    def search(self, query: str, limit: int = 10) -> List[Dict]:
+        """Search indexed pages"""
+        return self.mongodb_indexer.search_pages(query, limit)
     
     def get_statistics(self) -> Dict:
         """Get crawler statistics"""
         stats = self.stats.copy()
         stats['queue_size'] = self.url_queue.get_queue_size()
         stats['domains_crawled'] = len(self.stats['domains_crawled'])
+        stats['mongodb_indexed_count'] = self.mongodb_indexer.get_indexed_count()
         if self.stats['start_time']:
             stats['elapsed_time'] = time.time() - self.stats['start_time']
         return stats
@@ -467,12 +635,13 @@ async def main():
     """Main function for running the crawler"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='Web Crawler for Search Engine')
+    parser = argparse.ArgumentParser(description='Web Crawler for Search Engine with MongoDB')
     parser.add_argument('--seeds', nargs='+', required=True, help='Seed URLs to start crawling')
     parser.add_argument('--max-depth', type=int, default=3, help='Maximum crawl depth')
     parser.add_argument('--max-concurrent', type=int, default=10, help='Maximum concurrent requests')
     parser.add_argument('--output-dir', default='crawled_data', help='Output directory')
     parser.add_argument('--delay', type=float, nargs=2, default=[1.0, 3.0], help='Delay range between requests')
+    parser.add_argument('--search', type=str, help='Search query to test after crawling')
     
     args = parser.parse_args()
     
@@ -497,6 +666,16 @@ async def main():
         stats = crawler.get_statistics()
         for key, value in stats.items():
             print(f"  {key}: {value}")
+        
+        # Test search if query provided
+        if args.search:
+            print(f"\nSearch results for '{args.search}':")
+            results = crawler.search(args.search)
+            for i, result in enumerate(results, 1):
+                print(f"{i}. {result['title']}")
+                print(f"   URL: {result['url']}")
+                print(f"   Score: {result.get('score', 'N/A')}")
+                print()
 
 if __name__ == "__main__":
     asyncio.run(main())
